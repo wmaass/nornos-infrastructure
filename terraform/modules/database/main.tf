@@ -1,11 +1,12 @@
-# Nornos Database Module (RDS PostgreSQL)
+# Nornos Database Module - Hetzner Cloud
+# Deploys PostgreSQL and Redis on dedicated servers
 
 terraform {
   required_version = ">= 1.5.0"
   required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
+    hcloud = {
+      source  = "hetznercloud/hcloud"
+      version = "~> 1.45"
     }
     random = {
       source  = "hashicorp/random"
@@ -20,50 +21,48 @@ variable "environment" {
   type        = string
 }
 
-variable "vpc_id" {
-  description = "VPC ID"
+variable "network_id" {
+  description = "Hetzner network ID"
+  type        = number
+}
+
+variable "database_subnet_id" {
+  description = "Database subnet ID"
   type        = string
 }
 
-variable "database_subnet_ids" {
-  description = "Database subnet IDs"
-  type        = list(string)
+variable "firewall_id" {
+  description = "Firewall ID for database servers"
+  type        = number
 }
 
-variable "allowed_security_groups" {
-  description = "Security groups allowed to access database"
-  type        = list(string)
-  default     = []
+variable "ssh_key_id" {
+  description = "SSH key ID"
+  type        = number
 }
 
-variable "instance_class" {
-  description = "RDS instance class"
+variable "location" {
+  description = "Hetzner Cloud location"
   type        = string
-  default     = "db.t3.medium"
+  default     = "fsn1"
 }
 
-variable "allocated_storage" {
-  description = "Allocated storage in GB"
+variable "postgres_server_type" {
+  description = "Server type for PostgreSQL"
+  type        = string
+  default     = "cx31" # 2 vCPU, 8GB RAM
+}
+
+variable "redis_server_type" {
+  description = "Server type for Redis"
+  type        = string
+  default     = "cx21" # 2 vCPU, 4GB RAM
+}
+
+variable "postgres_volume_size" {
+  description = "Volume size for PostgreSQL data (GB)"
   type        = number
   default     = 100
-}
-
-variable "max_allocated_storage" {
-  description = "Max allocated storage for autoscaling"
-  type        = number
-  default     = 500
-}
-
-variable "multi_az" {
-  description = "Enable Multi-AZ deployment"
-  type        = bool
-  default     = true
-}
-
-variable "backup_retention_period" {
-  description = "Backup retention period in days"
-  type        = number
-  default     = 7
 }
 
 variable "tags" {
@@ -76,256 +75,259 @@ variable "tags" {
 locals {
   name_prefix = "nornos-${var.environment}"
   
-  common_tags = merge(var.tags, {
-    Environment = var.environment
-    ManagedBy   = "terraform"
-    Project     = "nornos"
+  common_labels = merge(var.tags, {
+    environment = var.environment
+    managed_by  = "terraform"
+    project     = "nornos"
   })
 }
 
-# Generate random password
-resource "random_password" "master" {
+# Generate PostgreSQL password
+resource "random_password" "postgres" {
   length           = 32
   special          = true
   override_special = "!#$%&*()-_=+[]{}<>:?"
 }
 
-# Store password in Secrets Manager
-resource "aws_secretsmanager_secret" "db_password" {
-  name        = "${local.name_prefix}/database/master-password"
-  description = "Master password for Nornos RDS database"
-
-  tags = local.common_tags
+# Generate Redis password
+resource "random_password" "redis" {
+  length  = 32
+  special = false
 }
 
-resource "aws_secretsmanager_secret_version" "db_password" {
-  secret_id = aws_secretsmanager_secret.db_password.id
-  secret_string = jsonencode({
-    username = "nornos_admin"
-    password = random_password.master.result
+# PostgreSQL Volume for data persistence
+resource "hcloud_volume" "postgres" {
+  name     = "${local.name_prefix}-postgres-data"
+  size     = var.postgres_volume_size
+  location = var.location
+  format   = "ext4"
+
+  labels = merge(local.common_labels, {
+    service = "postgresql"
   })
 }
 
-# DB Subnet Group
-resource "aws_db_subnet_group" "main" {
-  name       = "${local.name_prefix}-db-subnet-group"
-  subnet_ids = var.database_subnet_ids
+# PostgreSQL Server
+resource "hcloud_server" "postgres" {
+  name        = "${local.name_prefix}-postgres"
+  server_type = var.postgres_server_type
+  location    = var.location
+  image       = "ubuntu-22.04"
 
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-db-subnet-group"
+  ssh_keys     = [var.ssh_key_id]
+  firewall_ids = [var.firewall_id]
+
+  labels = merge(local.common_labels, {
+    service = "postgresql"
   })
-}
 
-# Security Group for RDS
-resource "aws_security_group" "database" {
-  name        = "${local.name_prefix}-database-sg"
-  description = "Security group for RDS PostgreSQL"
-  vpc_id      = var.vpc_id
-
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-database-sg"
-  })
-}
-
-resource "aws_security_group_rule" "database_ingress" {
-  count = length(var.allowed_security_groups)
-
-  type                     = "ingress"
-  from_port                = 5432
-  to_port                  = 5432
-  protocol                 = "tcp"
-  source_security_group_id = var.allowed_security_groups[count.index]
-  security_group_id        = aws_security_group.database.id
-}
-
-resource "aws_security_group_rule" "database_egress" {
-  type              = "egress"
-  from_port         = 0
-  to_port           = 0
-  protocol          = "-1"
-  cidr_blocks       = ["0.0.0.0/0"]
-  security_group_id = aws_security_group.database.id
-}
-
-# Parameter Group
-resource "aws_db_parameter_group" "main" {
-  name   = "${local.name_prefix}-pg16-params"
-  family = "postgres16"
-
-  parameter {
-    name  = "log_statement"
-    value = "all"
+  network {
+    network_id = var.network_id
   }
 
-  parameter {
-    name  = "log_min_duration_statement"
-    value = "1000" # Log queries > 1 second
-  }
+  user_data = <<-EOF
+    #cloud-config
+    package_update: true
+    package_upgrade: true
 
-  parameter {
-    name  = "shared_preload_libraries"
-    value = "pg_stat_statements"
-  }
+    packages:
+      - postgresql-16
+      - postgresql-contrib-16
 
-  parameter {
-    name  = "track_activity_query_size"
-    value = "4096"
-  }
+    write_files:
+      - path: /etc/postgresql/16/main/conf.d/custom.conf
+        content: |
+          listen_addresses = '*'
+          max_connections = 200
+          shared_buffers = 2GB
+          effective_cache_size = 6GB
+          maintenance_work_mem = 512MB
+          checkpoint_completion_target = 0.9
+          wal_buffers = 64MB
+          default_statistics_target = 100
+          random_page_cost = 1.1
+          effective_io_concurrency = 200
+          min_wal_size = 1GB
+          max_wal_size = 4GB
+          max_worker_processes = 4
+          max_parallel_workers_per_gather = 2
+          max_parallel_workers = 4
+          max_parallel_maintenance_workers = 2
+          # Logging
+          log_statement = 'all'
+          log_min_duration_statement = 1000
+          shared_preload_libraries = 'pg_stat_statements'
+          
+      - path: /etc/postgresql/16/main/pg_hba.conf
+        content: |
+          local   all             postgres                                peer
+          local   all             all                                     peer
+          host    all             all             10.0.0.0/16             scram-sha-256
+          host    all             all             127.0.0.1/32            scram-sha-256
+          host    all             all             ::1/128                 scram-sha-256
 
-  tags = local.common_tags
+    runcmd:
+      # Mount volume
+      - mkdir -p /mnt/postgres-data
+      - mount -o discard,defaults /dev/disk/by-id/scsi-0HC_Volume_${hcloud_volume.postgres.id} /mnt/postgres-data
+      - echo '/dev/disk/by-id/scsi-0HC_Volume_${hcloud_volume.postgres.id} /mnt/postgres-data ext4 discard,nofail,defaults 0 0' >> /etc/fstab
+      
+      # Stop PostgreSQL, move data, restart
+      - systemctl stop postgresql
+      - rsync -av /var/lib/postgresql/ /mnt/postgres-data/
+      - rm -rf /var/lib/postgresql
+      - ln -s /mnt/postgres-data /var/lib/postgresql
+      - chown -R postgres:postgres /mnt/postgres-data
+      
+      # Restart and configure
+      - systemctl start postgresql
+      - systemctl enable postgresql
+      
+      # Create database and user
+      - sudo -u postgres psql -c "CREATE USER nornos_admin WITH PASSWORD '${random_password.postgres.result}' SUPERUSER;"
+      - sudo -u postgres psql -c "CREATE DATABASE nornos OWNER nornos_admin;"
+      - sudo -u postgres psql -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+      
+      # Restart to apply config
+      - systemctl restart postgresql
+  EOF
+
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 }
 
-# RDS Instance
-resource "aws_db_instance" "main" {
-  identifier = "${local.name_prefix}-postgres"
-
-  engine               = "postgres"
-  engine_version       = "16.1"
-  instance_class       = var.instance_class
-  allocated_storage    = var.allocated_storage
-  max_allocated_storage = var.max_allocated_storage
-  storage_type         = "gp3"
-  storage_encrypted    = true
-
-  db_name  = "nornos"
-  username = "nornos_admin"
-  password = random_password.master.result
-
-  multi_az               = var.multi_az
-  db_subnet_group_name   = aws_db_subnet_group.main.name
-  vpc_security_group_ids = [aws_security_group.database.id]
-  parameter_group_name   = aws_db_parameter_group.main.name
-
-  backup_retention_period = var.backup_retention_period
-  backup_window           = "03:00-04:00"
-  maintenance_window      = "Mon:04:00-Mon:05:00"
-
-  skip_final_snapshot       = var.environment != "production"
-  final_snapshot_identifier = var.environment == "production" ? "${local.name_prefix}-final-snapshot" : null
-  deletion_protection       = var.environment == "production"
-
-  performance_insights_enabled          = true
-  performance_insights_retention_period = 7
-
-  enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
-
-  tags = local.common_tags
+# Attach volume to PostgreSQL server
+resource "hcloud_volume_attachment" "postgres" {
+  volume_id = hcloud_volume.postgres.id
+  server_id = hcloud_server.postgres.id
+  automount = false
 }
 
-# Read Replica (Production only)
-resource "aws_db_instance" "replica" {
-  count = var.environment == "production" ? 1 : 0
+# Redis Server
+resource "hcloud_server" "redis" {
+  name        = "${local.name_prefix}-redis"
+  server_type = var.redis_server_type
+  location    = var.location
+  image       = "ubuntu-22.04"
 
-  identifier = "${local.name_prefix}-postgres-replica"
+  ssh_keys     = [var.ssh_key_id]
+  firewall_ids = [var.firewall_id]
 
-  replicate_source_db = aws_db_instance.main.identifier
-  instance_class      = var.instance_class
-  storage_type        = "gp3"
-  storage_encrypted   = true
-
-  vpc_security_group_ids = [aws_security_group.database.id]
-  parameter_group_name   = aws_db_parameter_group.main.name
-
-  skip_final_snapshot = true
-
-  performance_insights_enabled          = true
-  performance_insights_retention_period = 7
-
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-postgres-replica"
+  labels = merge(local.common_labels, {
+    service = "redis"
   })
-}
 
-# ElastiCache Redis
-resource "aws_elasticache_subnet_group" "main" {
-  name       = "${local.name_prefix}-redis-subnet-group"
-  subnet_ids = var.database_subnet_ids
+  network {
+    network_id = var.network_id
+  }
 
-  tags = local.common_tags
-}
+  user_data = <<-EOF
+    #cloud-config
+    package_update: true
+    package_upgrade: true
 
-resource "aws_security_group" "redis" {
-  name        = "${local.name_prefix}-redis-sg"
-  description = "Security group for ElastiCache Redis"
-  vpc_id      = var.vpc_id
+    packages:
+      - redis-server
 
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-redis-sg"
-  })
-}
+    write_files:
+      - path: /etc/redis/redis.conf
+        content: |
+          bind 0.0.0.0
+          port 6379
+          requirepass ${random_password.redis.result}
+          
+          # Memory management
+          maxmemory 3gb
+          maxmemory-policy allkeys-lru
+          
+          # Persistence
+          appendonly yes
+          appendfsync everysec
+          
+          # Security
+          protected-mode yes
+          
+          # Performance
+          tcp-backlog 511
+          timeout 0
+          tcp-keepalive 300
+          
+          # Logging
+          loglevel notice
+          logfile /var/log/redis/redis-server.log
 
-resource "aws_security_group_rule" "redis_ingress" {
-  count = length(var.allowed_security_groups)
+    runcmd:
+      - systemctl restart redis-server
+      - systemctl enable redis-server
+  EOF
 
-  type                     = "ingress"
-  from_port                = 6379
-  to_port                  = 6379
-  protocol                 = "tcp"
-  source_security_group_id = var.allowed_security_groups[count.index]
-  security_group_id        = aws_security_group.redis.id
-}
-
-resource "aws_elasticache_replication_group" "main" {
-  replication_group_id = "${local.name_prefix}-redis"
-  description          = "Redis cluster for Nornos caching"
-
-  node_type            = "cache.t3.medium"
-  num_cache_clusters   = var.environment == "production" ? 3 : 1
-  port                 = 6379
-  parameter_group_name = "default.redis7"
-
-  automatic_failover_enabled = var.environment == "production"
-  multi_az_enabled           = var.environment == "production"
-
-  subnet_group_name  = aws_elasticache_subnet_group.main.name
-  security_group_ids = [aws_security_group.redis.id]
-
-  at_rest_encryption_enabled = true
-  transit_encryption_enabled = true
-
-  snapshot_retention_limit = var.environment == "production" ? 7 : 1
-  snapshot_window          = "02:00-03:00"
-
-  tags = local.common_tags
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 }
 
 # Outputs
-output "database_endpoint" {
-  description = "RDS endpoint"
-  value       = aws_db_instance.main.endpoint
+output "postgres_private_ip" {
+  description = "PostgreSQL private IP"
+  value       = hcloud_server.postgres.network[*].ip
 }
 
-output "database_port" {
-  description = "RDS port"
-  value       = aws_db_instance.main.port
+output "postgres_public_ip" {
+  description = "PostgreSQL public IP (for admin access)"
+  value       = hcloud_server.postgres.ipv4_address
 }
 
-output "database_name" {
-  description = "Database name"
-  value       = aws_db_instance.main.db_name
+output "postgres_port" {
+  description = "PostgreSQL port"
+  value       = 5432
 }
 
-output "database_security_group_id" {
-  description = "Database security group ID"
-  value       = aws_security_group.database.id
+output "postgres_database" {
+  description = "PostgreSQL database name"
+  value       = "nornos"
 }
 
-output "database_secret_arn" {
-  description = "ARN of the secret containing database credentials"
-  value       = aws_secretsmanager_secret.db_password.arn
+output "postgres_username" {
+  description = "PostgreSQL username"
+  value       = "nornos_admin"
 }
 
-output "redis_endpoint" {
-  description = "Redis primary endpoint"
-  value       = aws_elasticache_replication_group.main.primary_endpoint_address
+output "postgres_password" {
+  description = "PostgreSQL password"
+  value       = random_password.postgres.result
+  sensitive   = true
+}
+
+output "postgres_connection_string" {
+  description = "PostgreSQL connection string"
+  value       = "postgresql://nornos_admin:${random_password.postgres.result}@${hcloud_server.postgres.network[0].ip}:5432/nornos"
+  sensitive   = true
+}
+
+output "redis_private_ip" {
+  description = "Redis private IP"
+  value       = hcloud_server.redis.network[*].ip
+}
+
+output "redis_public_ip" {
+  description = "Redis public IP (for admin access)"
+  value       = hcloud_server.redis.ipv4_address
 }
 
 output "redis_port" {
   description = "Redis port"
-  value       = aws_elasticache_replication_group.main.port
+  value       = 6379
 }
 
-output "redis_security_group_id" {
-  description = "Redis security group ID"
-  value       = aws_security_group.redis.id
+output "redis_password" {
+  description = "Redis password"
+  value       = random_password.redis.result
+  sensitive   = true
+}
+
+output "redis_connection_string" {
+  description = "Redis connection string"
+  value       = "redis://:${random_password.redis.result}@${hcloud_server.redis.network[0].ip}:6379/0"
+  sensitive   = true
 }

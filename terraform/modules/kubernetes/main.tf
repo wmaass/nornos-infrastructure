@@ -1,15 +1,15 @@
-# Nornos EKS Kubernetes Cluster Module
+# Nornos Kubernetes Module - Hetzner Cloud (k3s)
 
 terraform {
   required_version = ">= 1.5.0"
   required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
+    hcloud = {
+      source  = "hetznercloud/hcloud"
+      version = "~> 1.45"
     }
-    kubernetes = {
-      source  = "hashicorp/kubernetes"
-      version = "~> 2.23"
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
     }
   }
 }
@@ -20,49 +20,67 @@ variable "environment" {
   type        = string
 }
 
-variable "vpc_id" {
-  description = "VPC ID"
-  type        = string
-}
-
-variable "private_subnet_ids" {
-  description = "Private subnet IDs for EKS nodes"
-  type        = list(string)
-}
-
-variable "public_subnet_ids" {
-  description = "Public subnet IDs for load balancers"
-  type        = list(string)
-}
-
-variable "kubernetes_version" {
-  description = "Kubernetes version"
-  type        = string
-  default     = "1.29"
-}
-
-variable "node_instance_types" {
-  description = "EC2 instance types for EKS nodes"
-  type        = list(string)
-  default     = ["t3.large", "t3.xlarge"]
-}
-
-variable "node_desired_size" {
-  description = "Desired number of nodes"
+variable "network_id" {
+  description = "Hetzner network ID"
   type        = number
-  default     = 3
 }
 
-variable "node_min_size" {
-  description = "Minimum number of nodes"
+variable "kubernetes_subnet_id" {
+  description = "Kubernetes subnet ID"
+  type        = string
+}
+
+variable "firewall_id" {
+  description = "Firewall ID for nodes"
+  type        = number
+}
+
+variable "location" {
+  description = "Hetzner Cloud location"
+  type        = string
+  default     = "fsn1"
+}
+
+variable "control_plane_type" {
+  description = "Server type for control plane nodes"
+  type        = string
+  default     = "cx31" # 2 vCPU, 8GB RAM
+}
+
+variable "worker_type" {
+  description = "Server type for worker nodes"
+  type        = string
+  default     = "cx41" # 4 vCPU, 16GB RAM
+}
+
+variable "agent_worker_type" {
+  description = "Server type for agent processing workers (larger)"
+  type        = string
+  default     = "cx51" # 8 vCPU, 32GB RAM
+}
+
+variable "control_plane_count" {
+  description = "Number of control plane nodes"
+  type        = number
+  default     = 1 # 3 for HA in production
+}
+
+variable "worker_count" {
+  description = "Number of general worker nodes"
   type        = number
   default     = 2
 }
 
-variable "node_max_size" {
-  description = "Maximum number of nodes"
+variable "agent_worker_count" {
+  description = "Number of agent processing workers"
   type        = number
-  default     = 10
+  default     = 1
+}
+
+variable "ssh_public_key" {
+  description = "SSH public key for server access"
+  type        = string
+  default     = ""
 }
 
 variable "tags" {
@@ -75,254 +93,288 @@ variable "tags" {
 locals {
   name_prefix = "nornos-${var.environment}"
   
-  common_tags = merge(var.tags, {
-    Environment = var.environment
-    ManagedBy   = "terraform"
-    Project     = "nornos"
-  })
-}
-
-# EKS Cluster IAM Role
-resource "aws_iam_role" "eks_cluster" {
-  name = "${local.name_prefix}-eks-cluster-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
-      Principal = {
-        Service = "eks.amazonaws.com"
-      }
-    }]
+  common_labels = merge(var.tags, {
+    environment = var.environment
+    managed_by  = "terraform"
+    project     = "nornos"
   })
 
-  tags = local.common_tags
+  k3s_version = "v1.29.0+k3s1"
 }
 
-resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
-  role       = aws_iam_role.eks_cluster.name
+# Generate SSH key if not provided
+resource "tls_private_key" "ssh" {
+  count     = var.ssh_public_key == "" ? 1 : 0
+  algorithm = "ED25519"
 }
 
-resource "aws_iam_role_policy_attachment" "eks_vpc_resource_controller" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSVPCResourceController"
-  role       = aws_iam_role.eks_cluster.name
+# SSH Key
+resource "hcloud_ssh_key" "main" {
+  name       = "${local.name_prefix}-ssh-key"
+  public_key = var.ssh_public_key != "" ? var.ssh_public_key : tls_private_key.ssh[0].public_key_openssh
+
+  labels = local.common_labels
 }
 
-# EKS Node IAM Role
-resource "aws_iam_role" "eks_nodes" {
-  name = "${local.name_prefix}-eks-node-role"
+# Placement Group for spreading nodes across hosts
+resource "hcloud_placement_group" "kubernetes" {
+  name = "${local.name_prefix}-k8s-spread"
+  type = "spread"
 
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
-      Principal = {
-        Service = "ec2.amazonaws.com"
-      }
-    }]
+  labels = local.common_labels
+}
+
+# Generate k3s token
+resource "random_password" "k3s_token" {
+  length  = 64
+  special = false
+}
+
+# Control Plane Node(s)
+resource "hcloud_server" "control_plane" {
+  count = var.control_plane_count
+
+  name        = "${local.name_prefix}-cp-${count.index + 1}"
+  server_type = var.control_plane_type
+  location    = var.location
+  image       = "ubuntu-22.04"
+
+  ssh_keys         = [hcloud_ssh_key.main.id]
+  firewall_ids     = [var.firewall_id]
+  placement_group_id = hcloud_placement_group.kubernetes.id
+
+  labels = merge(local.common_labels, {
+    role = "control-plane"
   })
 
-  tags = local.common_tags
-}
-
-resource "aws_iam_role_policy_attachment" "eks_worker_node_policy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
-  role       = aws_iam_role.eks_nodes.name
-}
-
-resource "aws_iam_role_policy_attachment" "eks_cni_policy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
-  role       = aws_iam_role.eks_nodes.name
-}
-
-resource "aws_iam_role_policy_attachment" "eks_container_registry" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
-  role       = aws_iam_role.eks_nodes.name
-}
-
-# EKS Cluster Security Group
-resource "aws_security_group" "eks_cluster" {
-  name        = "${local.name_prefix}-eks-cluster-sg"
-  description = "Security group for EKS cluster"
-  vpc_id      = var.vpc_id
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+  network {
+    network_id = var.network_id
   }
 
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-eks-cluster-sg"
-  })
+  user_data = <<-EOF
+    #cloud-config
+    package_update: true
+    package_upgrade: true
+    
+    packages:
+      - curl
+      - apt-transport-https
+      - ca-certificates
+
+    write_files:
+      - path: /etc/rancher/k3s/config.yaml
+        content: |
+          cluster-init: ${count.index == 0 ? "true" : "false"}
+          token: "${random_password.k3s_token.result}"
+          tls-san:
+            - "${local.name_prefix}-cp-${count.index + 1}"
+          disable:
+            - traefik
+          node-label:
+            - "node.kubernetes.io/role=control-plane"
+
+    runcmd:
+      - curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="${local.k3s_version}" sh -s - server
+      - sleep 30
+      # Install Helm
+      - curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+  EOF
+
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 }
 
-# EKS Cluster
-resource "aws_eks_cluster" "main" {
-  name     = local.name_prefix
-  role_arn = aws_iam_role.eks_cluster.arn
-  version  = var.kubernetes_version
+# General Worker Nodes
+resource "hcloud_server" "worker" {
+  count = var.worker_count
 
-  vpc_config {
-    subnet_ids              = concat(var.private_subnet_ids, var.public_subnet_ids)
-    endpoint_private_access = true
-    endpoint_public_access  = true
-    security_group_ids      = [aws_security_group.eks_cluster.id]
-  }
+  name        = "${local.name_prefix}-worker-${count.index + 1}"
+  server_type = var.worker_type
+  location    = var.location
+  image       = "ubuntu-22.04"
 
-  enabled_cluster_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+  ssh_keys         = [hcloud_ssh_key.main.id]
+  firewall_ids     = [var.firewall_id]
+  placement_group_id = hcloud_placement_group.kubernetes.id
 
-  tags = local.common_tags
-
-  depends_on = [
-    aws_iam_role_policy_attachment.eks_cluster_policy,
-    aws_iam_role_policy_attachment.eks_vpc_resource_controller,
-  ]
-}
-
-# EKS Node Group - General Purpose
-resource "aws_eks_node_group" "general" {
-  cluster_name    = aws_eks_cluster.main.name
-  node_group_name = "${local.name_prefix}-general"
-  node_role_arn   = aws_iam_role.eks_nodes.arn
-  subnet_ids      = var.private_subnet_ids
-  instance_types  = var.node_instance_types
-
-  scaling_config {
-    desired_size = var.node_desired_size
-    min_size     = var.node_min_size
-    max_size     = var.node_max_size
-  }
-
-  update_config {
-    max_unavailable = 1
-  }
-
-  labels = {
-    role = "general"
-  }
-
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-general-nodes"
+  labels = merge(local.common_labels, {
+    role = "worker"
   })
 
-  depends_on = [
-    aws_iam_role_policy_attachment.eks_worker_node_policy,
-    aws_iam_role_policy_attachment.eks_cni_policy,
-    aws_iam_role_policy_attachment.eks_container_registry,
-  ]
+  network {
+    network_id = var.network_id
+  }
+
+  user_data = <<-EOF
+    #cloud-config
+    package_update: true
+    package_upgrade: true
+    
+    packages:
+      - curl
+
+    runcmd:
+      - |
+        until curl -sf http://${hcloud_server.control_plane[0].ipv4_address}:6443/healthz; do
+          echo "Waiting for control plane..."
+          sleep 10
+        done
+      - curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="${local.k3s_version}" K3S_URL="https://${hcloud_server.control_plane[0].ipv4_address}:6443" K3S_TOKEN="${random_password.k3s_token.result}" sh -s - agent --node-label="node.kubernetes.io/role=worker"
+  EOF
+
+  depends_on = [hcloud_server.control_plane]
+
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 }
 
-# EKS Node Group - Agent Processing (larger instances for AI workloads)
-resource "aws_eks_node_group" "agents" {
-  cluster_name    = aws_eks_cluster.main.name
-  node_group_name = "${local.name_prefix}-agents"
-  node_role_arn   = aws_iam_role.eks_nodes.arn
-  subnet_ids      = var.private_subnet_ids
-  instance_types  = ["t3.2xlarge", "m5.2xlarge"]
+# Agent Processing Workers (larger nodes for AI workloads)
+resource "hcloud_server" "agent_worker" {
+  count = var.agent_worker_count
 
-  scaling_config {
-    desired_size = 2
-    min_size     = 1
-    max_size     = 10
-  }
+  name        = "${local.name_prefix}-agent-${count.index + 1}"
+  server_type = var.agent_worker_type
+  location    = var.location
+  image       = "ubuntu-22.04"
 
-  labels = {
-    role        = "agents"
-    workload    = "ai-processing"
-  }
+  ssh_keys         = [hcloud_ssh_key.main.id]
+  firewall_ids     = [var.firewall_id]
+  placement_group_id = hcloud_placement_group.kubernetes.id
 
-  taint {
-    key    = "workload"
-    value  = "ai-processing"
-    effect = "NO_SCHEDULE"
-  }
-
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-agent-nodes"
+  labels = merge(local.common_labels, {
+    role     = "agent-worker"
+    workload = "ai-processing"
   })
 
-  depends_on = [
-    aws_iam_role_policy_attachment.eks_worker_node_policy,
-    aws_iam_role_policy_attachment.eks_cni_policy,
-    aws_iam_role_policy_attachment.eks_container_registry,
-  ]
+  network {
+    network_id = var.network_id
+  }
+
+  user_data = <<-EOF
+    #cloud-config
+    package_update: true
+    package_upgrade: true
+    
+    packages:
+      - curl
+
+    runcmd:
+      - |
+        until curl -sf http://${hcloud_server.control_plane[0].ipv4_address}:6443/healthz; do
+          echo "Waiting for control plane..."
+          sleep 10
+        done
+      - curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="${local.k3s_version}" K3S_URL="https://${hcloud_server.control_plane[0].ipv4_address}:6443" K3S_TOKEN="${random_password.k3s_token.result}" sh -s - agent --node-label="node.kubernetes.io/role=agent" --node-label="workload=ai-processing" --node-taint="workload=ai-processing:NoSchedule"
+  EOF
+
+  depends_on = [hcloud_server.control_plane]
+
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 }
 
-# OIDC Provider for IRSA (IAM Roles for Service Accounts)
-data "tls_certificate" "eks" {
-  url = aws_eks_cluster.main.identity[0].oidc[0].issuer
+# Load Balancer for ingress
+resource "hcloud_load_balancer" "ingress" {
+  name               = "${local.name_prefix}-ingress-lb"
+  load_balancer_type = "lb11"
+  location           = var.location
+
+  labels = local.common_labels
 }
 
-resource "aws_iam_openid_connect_provider" "eks" {
-  client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = [data.tls_certificate.eks.certificates[0].sha1_fingerprint]
-  url             = aws_eks_cluster.main.identity[0].oidc[0].issuer
-
-  tags = local.common_tags
+resource "hcloud_load_balancer_network" "ingress" {
+  load_balancer_id = hcloud_load_balancer.ingress.id
+  network_id       = var.network_id
 }
 
-# EKS Add-ons
-resource "aws_eks_addon" "coredns" {
-  cluster_name = aws_eks_cluster.main.name
-  addon_name   = "coredns"
+resource "hcloud_load_balancer_target" "workers" {
+  count = var.worker_count
 
-  depends_on = [aws_eks_node_group.general]
+  type             = "server"
+  load_balancer_id = hcloud_load_balancer.ingress.id
+  server_id        = hcloud_server.worker[count.index].id
+  use_private_ip   = true
+
+  depends_on = [hcloud_load_balancer_network.ingress]
 }
 
-resource "aws_eks_addon" "kube_proxy" {
-  cluster_name = aws_eks_cluster.main.name
-  addon_name   = "kube-proxy"
+resource "hcloud_load_balancer_service" "http" {
+  load_balancer_id = hcloud_load_balancer.ingress.id
+  protocol         = "tcp"
+  listen_port      = 80
+  destination_port = 80
+
+  health_check {
+    protocol = "tcp"
+    port     = 80
+    interval = 10
+    timeout  = 5
+    retries  = 3
+  }
 }
 
-resource "aws_eks_addon" "vpc_cni" {
-  cluster_name = aws_eks_cluster.main.name
-  addon_name   = "vpc-cni"
-}
+resource "hcloud_load_balancer_service" "https" {
+  load_balancer_id = hcloud_load_balancer.ingress.id
+  protocol         = "tcp"
+  listen_port      = 443
+  destination_port = 443
 
-resource "aws_eks_addon" "ebs_csi_driver" {
-  cluster_name = aws_eks_cluster.main.name
-  addon_name   = "aws-ebs-csi-driver"
-
-  depends_on = [aws_eks_node_group.general]
+  health_check {
+    protocol = "tcp"
+    port     = 443
+    interval = 10
+    timeout  = 5
+    retries  = 3
+  }
 }
 
 # Outputs
-output "cluster_id" {
-  description = "EKS cluster ID"
-  value       = aws_eks_cluster.main.id
+output "control_plane_ips" {
+  description = "Control plane public IPs"
+  value       = hcloud_server.control_plane[*].ipv4_address
 }
 
-output "cluster_name" {
-  description = "EKS cluster name"
-  value       = aws_eks_cluster.main.name
+output "control_plane_private_ips" {
+  description = "Control plane private IPs"
+  value       = [for s in hcloud_server.control_plane : s.network[*].ip]
 }
 
-output "cluster_endpoint" {
-  description = "EKS cluster endpoint"
-  value       = aws_eks_cluster.main.endpoint
+output "worker_ips" {
+  description = "Worker public IPs"
+  value       = hcloud_server.worker[*].ipv4_address
 }
 
-output "cluster_certificate_authority" {
-  description = "EKS cluster CA certificate"
-  value       = aws_eks_cluster.main.certificate_authority[0].data
+output "agent_worker_ips" {
+  description = "Agent worker public IPs"
+  value       = hcloud_server.agent_worker[*].ipv4_address
 }
 
-output "cluster_security_group_id" {
-  description = "EKS cluster security group ID"
-  value       = aws_security_group.eks_cluster.id
+output "load_balancer_ip" {
+  description = "Load balancer public IP"
+  value       = hcloud_load_balancer.ingress.ipv4
 }
 
-output "oidc_provider_arn" {
-  description = "OIDC provider ARN for IRSA"
-  value       = aws_iam_openid_connect_provider.eks.arn
+output "k3s_token" {
+  description = "K3s cluster token"
+  value       = random_password.k3s_token.result
+  sensitive   = true
 }
 
-output "oidc_provider_url" {
-  description = "OIDC provider URL"
-  value       = aws_eks_cluster.main.identity[0].oidc[0].issuer
+output "ssh_private_key" {
+  description = "SSH private key (if generated)"
+  value       = var.ssh_public_key == "" ? tls_private_key.ssh[0].private_key_openssh : null
+  sensitive   = true
+}
+
+output "kubeconfig_command" {
+  description = "Command to get kubeconfig"
+  value       = "scp root@${hcloud_server.control_plane[0].ipv4_address}:/etc/rancher/k3s/k3s.yaml ./kubeconfig && sed -i '' 's/127.0.0.1/${hcloud_server.control_plane[0].ipv4_address}/g' ./kubeconfig"
+}
+
+output "ssh_key_id" {
+  description = "SSH key ID"
+  value       = hcloud_ssh_key.main.id
 }

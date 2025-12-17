@@ -1,11 +1,11 @@
-# Nornos VPC and Networking Module
+# Nornos Networking Module - Hetzner Cloud
 
 terraform {
   required_version = ">= 1.5.0"
   required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
+    hcloud = {
+      source  = "hetznercloud/hcloud"
+      version = "~> 1.45"
     }
   }
 }
@@ -16,16 +16,16 @@ variable "environment" {
   type        = string
 }
 
-variable "vpc_cidr" {
-  description = "CIDR block for VPC"
+variable "network_cidr" {
+  description = "CIDR block for the network"
   type        = string
   default     = "10.0.0.0/16"
 }
 
-variable "availability_zones" {
-  description = "List of availability zones"
-  type        = list(string)
-  default     = ["eu-central-1a", "eu-central-1b", "eu-central-1c"]
+variable "location" {
+  description = "Hetzner Cloud location"
+  type        = string
+  default     = "fsn1" # Falkenstein, Germany
 }
 
 variable "tags" {
@@ -38,196 +38,200 @@ variable "tags" {
 locals {
   name_prefix = "nornos-${var.environment}"
   
-  common_tags = merge(var.tags, {
-    Environment = var.environment
-    ManagedBy   = "terraform"
-    Project     = "nornos"
+  common_labels = merge(var.tags, {
+    environment = var.environment
+    managed_by  = "terraform"
+    project     = "nornos"
   })
 }
 
-# VPC
-resource "aws_vpc" "main" {
-  cidr_block           = var.vpc_cidr
-  enable_dns_hostnames = true
-  enable_dns_support   = true
+# Private Network
+resource "hcloud_network" "main" {
+  name     = "${local.name_prefix}-network"
+  ip_range = var.network_cidr
 
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-vpc"
-  })
+  labels = local.common_labels
 }
 
-# Internet Gateway
-resource "aws_internet_gateway" "main" {
-  vpc_id = aws_vpc.main.id
-
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-igw"
-  })
+# Subnet for Kubernetes nodes
+resource "hcloud_network_subnet" "kubernetes" {
+  network_id   = hcloud_network.main.id
+  type         = "cloud"
+  network_zone = "eu-central"
+  ip_range     = cidrsubnet(var.network_cidr, 8, 1) # 10.0.1.0/24
 }
 
-# Public Subnets
-resource "aws_subnet" "public" {
-  count = length(var.availability_zones)
-
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = cidrsubnet(var.vpc_cidr, 4, count.index)
-  availability_zone       = var.availability_zones[count.index]
-  map_public_ip_on_launch = true
-
-  tags = merge(local.common_tags, {
-    Name                                           = "${local.name_prefix}-public-${var.availability_zones[count.index]}"
-    "kubernetes.io/role/elb"                       = "1"
-    "kubernetes.io/cluster/${local.name_prefix}"   = "shared"
-  })
+# Subnet for databases
+resource "hcloud_network_subnet" "database" {
+  network_id   = hcloud_network.main.id
+  type         = "cloud"
+  network_zone = "eu-central"
+  ip_range     = cidrsubnet(var.network_cidr, 8, 2) # 10.0.2.0/24
 }
 
-# Private Subnets (for EKS nodes and databases)
-resource "aws_subnet" "private" {
-  count = length(var.availability_zones)
-
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = cidrsubnet(var.vpc_cidr, 4, count.index + length(var.availability_zones))
-  availability_zone = var.availability_zones[count.index]
-
-  tags = merge(local.common_tags, {
-    Name                                           = "${local.name_prefix}-private-${var.availability_zones[count.index]}"
-    "kubernetes.io/role/internal-elb"              = "1"
-    "kubernetes.io/cluster/${local.name_prefix}"   = "shared"
-  })
+# Subnet for load balancers
+resource "hcloud_network_subnet" "loadbalancer" {
+  network_id   = hcloud_network.main.id
+  type         = "cloud"
+  network_zone = "eu-central"
+  ip_range     = cidrsubnet(var.network_cidr, 8, 3) # 10.0.3.0/24
 }
 
-# Database Subnets (isolated)
-resource "aws_subnet" "database" {
-  count = length(var.availability_zones)
+# Firewall for Kubernetes nodes
+resource "hcloud_firewall" "kubernetes" {
+  name = "${local.name_prefix}-k8s-firewall"
 
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = cidrsubnet(var.vpc_cidr, 4, count.index + 2 * length(var.availability_zones))
-  availability_zone = var.availability_zones[count.index]
+  labels = local.common_labels
 
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-database-${var.availability_zones[count.index]}"
-  })
-}
-
-# NAT Gateway (one per AZ for HA)
-resource "aws_eip" "nat" {
-  count  = length(var.availability_zones)
-  domain = "vpc"
-
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-nat-eip-${var.availability_zones[count.index]}"
-  })
-}
-
-resource "aws_nat_gateway" "main" {
-  count = length(var.availability_zones)
-
-  allocation_id = aws_eip.nat[count.index].id
-  subnet_id     = aws_subnet.public[count.index].id
-
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-nat-${var.availability_zones[count.index]}"
-  })
-
-  depends_on = [aws_internet_gateway.main]
-}
-
-# Route Tables
-resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.main.id
-
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.main.id
+  # SSH access (restrict in production)
+  rule {
+    direction  = "in"
+    protocol   = "tcp"
+    port       = "22"
+    source_ips = ["0.0.0.0/0", "::/0"]
   }
 
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-public-rt"
-  })
-}
-
-resource "aws_route_table" "private" {
-  count  = length(var.availability_zones)
-  vpc_id = aws_vpc.main.id
-
-  route {
-    cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.main[count.index].id
+  # Kubernetes API
+  rule {
+    direction  = "in"
+    protocol   = "tcp"
+    port       = "6443"
+    source_ips = ["0.0.0.0/0", "::/0"]
   }
 
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-private-rt-${var.availability_zones[count.index]}"
-  })
+  # HTTP/HTTPS
+  rule {
+    direction  = "in"
+    protocol   = "tcp"
+    port       = "80"
+    source_ips = ["0.0.0.0/0", "::/0"]
+  }
+
+  rule {
+    direction  = "in"
+    protocol   = "tcp"
+    port       = "443"
+    source_ips = ["0.0.0.0/0", "::/0"]
+  }
+
+  # NodePort range
+  rule {
+    direction  = "in"
+    protocol   = "tcp"
+    port       = "30000-32767"
+    source_ips = ["0.0.0.0/0", "::/0"]
+  }
+
+  # Internal cluster communication
+  rule {
+    direction  = "in"
+    protocol   = "tcp"
+    port       = "any"
+    source_ips = [var.network_cidr]
+  }
+
+  rule {
+    direction  = "in"
+    protocol   = "udp"
+    port       = "any"
+    source_ips = [var.network_cidr]
+  }
+
+  # ICMP
+  rule {
+    direction  = "in"
+    protocol   = "icmp"
+    source_ips = ["0.0.0.0/0", "::/0"]
+  }
+
+  # Allow all outbound
+  rule {
+    direction       = "out"
+    protocol        = "tcp"
+    port            = "any"
+    destination_ips = ["0.0.0.0/0", "::/0"]
+  }
+
+  rule {
+    direction       = "out"
+    protocol        = "udp"
+    port            = "any"
+    destination_ips = ["0.0.0.0/0", "::/0"]
+  }
+
+  rule {
+    direction       = "out"
+    protocol        = "icmp"
+    destination_ips = ["0.0.0.0/0", "::/0"]
+  }
 }
 
-# Route Table Associations
-resource "aws_route_table_association" "public" {
-  count = length(var.availability_zones)
+# Firewall for database servers
+resource "hcloud_firewall" "database" {
+  name = "${local.name_prefix}-db-firewall"
 
-  subnet_id      = aws_subnet.public[count.index].id
-  route_table_id = aws_route_table.public.id
+  labels = local.common_labels
+
+  # PostgreSQL - only from internal network
+  rule {
+    direction  = "in"
+    protocol   = "tcp"
+    port       = "5432"
+    source_ips = [var.network_cidr]
+  }
+
+  # Redis - only from internal network
+  rule {
+    direction  = "in"
+    protocol   = "tcp"
+    port       = "6379"
+    source_ips = [var.network_cidr]
+  }
+
+  # SSH - only from internal network
+  rule {
+    direction  = "in"
+    protocol   = "tcp"
+    port       = "22"
+    source_ips = [var.network_cidr]
+  }
+
+  # Allow all outbound
+  rule {
+    direction       = "out"
+    protocol        = "tcp"
+    port            = "any"
+    destination_ips = ["0.0.0.0/0", "::/0"]
+  }
 }
-
-resource "aws_route_table_association" "private" {
-  count = length(var.availability_zones)
-
-  subnet_id      = aws_subnet.private[count.index].id
-  route_table_id = aws_route_table.private[count.index].id
-}
-
-resource "aws_route_table_association" "database" {
-  count = length(var.availability_zones)
-
-  subnet_id      = aws_subnet.database[count.index].id
-  route_table_id = aws_route_table.private[count.index].id
-}
-
-# VPC Endpoints for AWS Services
-resource "aws_vpc_endpoint" "s3" {
-  vpc_id       = aws_vpc.main.id
-  service_name = "com.amazonaws.${data.aws_region.current.name}.s3"
-
-  tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-s3-endpoint"
-  })
-}
-
-resource "aws_vpc_endpoint_route_table_association" "s3_private" {
-  count = length(var.availability_zones)
-
-  route_table_id  = aws_route_table.private[count.index].id
-  vpc_endpoint_id = aws_vpc_endpoint.s3.id
-}
-
-data "aws_region" "current" {}
 
 # Outputs
-output "vpc_id" {
-  description = "VPC ID"
-  value       = aws_vpc.main.id
+output "network_id" {
+  description = "Network ID"
+  value       = hcloud_network.main.id
 }
 
-output "vpc_cidr" {
-  description = "VPC CIDR block"
-  value       = aws_vpc.main.cidr_block
+output "network_cidr" {
+  description = "Network CIDR"
+  value       = hcloud_network.main.ip_range
 }
 
-output "public_subnet_ids" {
-  description = "Public subnet IDs"
-  value       = aws_subnet.public[*].id
+output "kubernetes_subnet_id" {
+  description = "Kubernetes subnet ID"
+  value       = hcloud_network_subnet.kubernetes.id
 }
 
-output "private_subnet_ids" {
-  description = "Private subnet IDs"
-  value       = aws_subnet.private[*].id
+output "database_subnet_id" {
+  description = "Database subnet ID"
+  value       = hcloud_network_subnet.database.id
 }
 
-output "database_subnet_ids" {
-  description = "Database subnet IDs"
-  value       = aws_subnet.database[*].id
+output "kubernetes_firewall_id" {
+  description = "Kubernetes firewall ID"
+  value       = hcloud_firewall.kubernetes.id
 }
 
-output "nat_gateway_ips" {
-  description = "NAT Gateway public IPs"
-  value       = aws_eip.nat[*].public_ip
+output "database_firewall_id" {
+  description = "Database firewall ID"
+  value       = hcloud_firewall.database.id
 }

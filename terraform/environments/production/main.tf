@@ -1,4 +1,4 @@
-# Nornos Development Environment - Hetzner Cloud
+# Nornos Production Environment - Hetzner Cloud
 
 terraform {
   required_version = ">= 1.5.0"
@@ -18,13 +18,13 @@ terraform {
     }
   }
 
-  # For production, use a remote backend (S3, Terraform Cloud, etc.)
-  # backend "s3" {
-  #   bucket         = "nornos-terraform-state"
-  #   key            = "dev/terraform.tfstate"
-  #   region         = "eu-central-1"
-  #   encrypt        = true
-  # }
+  # Remote backend for production state
+  backend "s3" {
+    bucket         = "nornos-terraform-state"
+    key            = "production/terraform.tfstate"
+    region         = "eu-central-1"  # Can use any S3-compatible storage
+    encrypt        = true
+  }
 }
 
 # Hetzner Cloud Provider
@@ -42,20 +42,18 @@ variable "hcloud_token" {
 variable "environment" {
   description = "Environment name"
   type        = string
-  default     = "dev"
+  default     = "production"
 }
 
 variable "location" {
   description = "Hetzner Cloud location"
   type        = string
-  default     = "fsn1" # Falkenstein, Germany (cheapest)
-  # Options: fsn1 (Falkenstein), nbg1 (Nuremberg), hel1 (Helsinki), ash (Ashburn)
+  default     = "fsn1"
 }
 
 variable "ssh_public_key" {
   description = "SSH public key for server access"
   type        = string
-  default     = ""
 }
 
 # Networking
@@ -71,7 +69,7 @@ module "networking" {
   }
 }
 
-# Kubernetes (k3s cluster)
+# Kubernetes (k3s HA cluster)
 module "kubernetes" {
   source = "../../modules/kubernetes"
 
@@ -82,14 +80,14 @@ module "kubernetes" {
   location             = var.location
   ssh_public_key       = var.ssh_public_key
   
-  # Dev environment: smaller instances
-  control_plane_type  = "cx21"  # 2 vCPU, 4GB RAM - €4.51/month
-  worker_type         = "cx31"  # 2 vCPU, 8GB RAM - €8.98/month
-  agent_worker_type   = "cx41"  # 4 vCPU, 16GB RAM - €17.85/month
+  # Production: HA setup with larger instances
+  control_plane_type  = "cx31"  # 2 vCPU, 8GB RAM
+  worker_type         = "cx41"  # 4 vCPU, 16GB RAM
+  agent_worker_type   = "cx51"  # 8 vCPU, 32GB RAM
   
-  control_plane_count = 1
-  worker_count        = 2
-  agent_worker_count  = 1
+  control_plane_count = 3       # HA control plane
+  worker_count        = 4       # More workers for redundancy
+  agent_worker_count  = 3       # More AI processing capacity
 
   tags = {
     environment = var.environment
@@ -107,10 +105,10 @@ module "database" {
   ssh_key_id         = module.kubernetes.ssh_key_id
   location           = var.location
   
-  # Dev environment: smaller instances
-  postgres_server_type = "cx21"  # 2 vCPU, 4GB RAM
-  redis_server_type    = "cx11"  # 1 vCPU, 2GB RAM - €3.29/month
-  postgres_volume_size = 50      # 50GB - €2.30/month
+  # Production: larger instances
+  postgres_server_type = "cx41"  # 4 vCPU, 16GB RAM
+  redis_server_type    = "cx31"  # 2 vCPU, 8GB RAM
+  postgres_volume_size = 500     # 500GB for production data
 
   tags = {
     environment = var.environment
@@ -119,18 +117,14 @@ module "database" {
   depends_on = [module.kubernetes]
 }
 
-# Hetzner Object Storage (S3-compatible)
-# Note: Hetzner Object Storage is in beta, configure via console
-# Alternative: Deploy MinIO in Kubernetes
-
 # Outputs
 output "cluster_info" {
   description = "Kubernetes cluster information"
   value = {
-    control_plane_ip = module.kubernetes.control_plane_ips[0]
-    load_balancer_ip = module.kubernetes.load_balancer_ip
-    worker_ips       = module.kubernetes.worker_ips
-    agent_worker_ips = module.kubernetes.agent_worker_ips
+    control_plane_ips = module.kubernetes.control_plane_ips
+    load_balancer_ip  = module.kubernetes.load_balancer_ip
+    worker_ips        = module.kubernetes.worker_ips
+    agent_worker_ips  = module.kubernetes.agent_worker_ips
   }
 }
 
@@ -161,21 +155,15 @@ output "kubeconfig_command" {
   value       = module.kubernetes.kubeconfig_command
 }
 
-output "ssh_private_key" {
-  description = "SSH private key (if generated)"
-  value       = module.kubernetes.ssh_private_key
-  sensitive   = true
-}
-
 output "monthly_cost_estimate" {
   description = "Estimated monthly cost (EUR)"
   value = {
-    control_plane = "€4.51 x 1 = €4.51"
-    workers       = "€8.98 x 2 = €17.96"
-    agent_workers = "€17.85 x 1 = €17.85"
-    postgres      = "€4.51 + €2.30 (volume) = €6.81"
-    redis         = "€3.29"
+    control_plane = "€8.98 x 3 = €26.94"
+    workers       = "€17.85 x 4 = €71.40"
+    agent_workers = "€35.58 x 3 = €106.74"
+    postgres      = "€17.85 + €23.00 (500GB) = €40.85"
+    redis         = "€8.98"
     load_balancer = "€5.39"
-    total         = "~€56/month"
+    total         = "~€260/month"
   }
 }
