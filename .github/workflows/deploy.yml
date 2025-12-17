@@ -1,0 +1,208 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+        - dev
+        - staging
+        - production
+      service:
+        description: 'Service to deploy (or "all")'
+        required: true
+        type: choice
+        options:
+        - all
+        - patient-app
+        - doctor-app
+        - agent-service
+        - relay-server
+        - shared-data-server
+        - auth-service
+        - vault-server
+      version:
+        description: 'Version tag to deploy'
+        required: true
+        default: 'latest'
+
+env:
+  AWS_REGION: eu-central-1
+
+jobs:
+  # Approval gate for production
+  approval:
+    name: Approval
+    runs-on: ubuntu-latest
+    if: inputs.environment == 'production'
+    environment: production-approval
+    steps:
+    - name: Production deployment approved
+      run: echo "Production deployment approved"
+
+  # Build and push Docker images
+  build:
+    name: Build ${{ inputs.service }}
+    runs-on: ubuntu-latest
+    needs: [approval]
+    if: always() && (needs.approval.result == 'success' || inputs.environment != 'production')
+    
+    strategy:
+      matrix:
+        service: ${{ inputs.service == 'all' && fromJson('["patient-app", "doctor-app", "agent-service", "relay-server", "shared-data-server", "auth-service", "vault-server"]') || fromJson(format('["{0}"]', inputs.service)) }}
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        repository: nornos/nornos
+        token: ${{ secrets.NORNOS_REPO_TOKEN }}
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./${{ matrix.service }}
+        push: true
+        tags: |
+          ${{ steps.login-ecr.outputs.registry }}/nornos/${{ matrix.service }}:${{ inputs.version }}
+          ${{ steps.login-ecr.outputs.registry }}/nornos/${{ matrix.service }}:${{ github.sha }}
+
+  # Deploy infrastructure changes (Terraform)
+  infrastructure:
+    name: Infrastructure
+    runs-on: ubuntu-latest
+    needs: [approval]
+    if: always() && (needs.approval.result == 'success' || inputs.environment != 'production')
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.0
+
+    - name: Terraform Init
+      run: terraform init
+      working-directory: terraform/environments/${{ inputs.environment }}
+
+    - name: Terraform Apply
+      run: terraform apply -auto-approve
+      working-directory: terraform/environments/${{ inputs.environment }}
+
+  # Deploy to Kubernetes
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    needs: [build, infrastructure]
+    environment: ${{ inputs.environment }}
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: v1.29.0
+
+    - name: Install kustomize
+      uses: imranismail/setup-kustomize@v2
+
+    - name: Configure kubectl
+      run: |
+        aws eks update-kubeconfig --name nornos-${{ inputs.environment }} --region ${{ env.AWS_REGION }}
+
+    - name: Update image tags
+      run: |
+        cd kubernetes/overlays/${{ inputs.environment }}
+        
+        # Update image tags for each service
+        if [ "${{ inputs.service }}" == "all" ]; then
+          for svc in patient-app doctor-app agent-service relay-server shared-data-server auth-service vault-server; do
+            kustomize edit set image nornos/$svc=${{ secrets.ECR_REGISTRY }}/nornos/$svc:${{ inputs.version }}
+          done
+        else
+          kustomize edit set image nornos/${{ inputs.service }}=${{ secrets.ECR_REGISTRY }}/nornos/${{ inputs.service }}:${{ inputs.version }}
+        fi
+
+    - name: Deploy to Kubernetes
+      run: |
+        kustomize build kubernetes/overlays/${{ inputs.environment }} | kubectl apply -f -
+        
+        # Wait for rollout
+        if [ "${{ inputs.service }}" == "all" ]; then
+          for svc in patient-app doctor-app agent-service relay-server shared-data-server auth-service vault-server; do
+            kubectl rollout status deployment/$svc -n nornos --timeout=300s || true
+          done
+        else
+          kubectl rollout status deployment/${{ inputs.service }} -n nornos --timeout=300s
+        fi
+
+    - name: Verify deployment
+      run: |
+        kubectl get pods -n nornos
+        kubectl get services -n nornos
+
+  # Post-deployment tasks
+  post-deploy:
+    name: Post-deployment
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    
+    steps:
+    - name: Slack notification
+      uses: slackapi/slack-github-action@v1.24.0
+      with:
+        payload: |
+          {
+            "text": "Deployment to ${{ inputs.environment }} completed",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Deployment Complete* :rocket:\n*Environment:* ${{ inputs.environment }}\n*Service:* ${{ inputs.service }}\n*Version:* ${{ inputs.version }}"
+                }
+              }
+            ]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      continue-on-error: true
+
+    - name: Update deployment status
+      run: |
+        echo "Deployment completed successfully"
+        echo "Environment: ${{ inputs.environment }}"
+        echo "Service: ${{ inputs.service }}"
+        echo "Version: ${{ inputs.version }}"

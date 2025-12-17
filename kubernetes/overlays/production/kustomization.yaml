@@ -1,0 +1,101 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nornos
+
+resources:
+- ../../base
+
+namePrefix: prod-
+
+commonLabels:
+  environment: production
+
+# Production patches
+patches:
+# Higher replicas for production
+- patch: |-
+    - op: replace
+      path: /spec/replicas
+      value: 3
+  target:
+    kind: Deployment
+    name: "patient-app|doctor-app|relay-server"
+
+- patch: |-
+    - op: replace
+      path: /spec/replicas
+      value: 5
+  target:
+    kind: Deployment
+    name: "agent-service"
+
+# Production resource limits
+- patch: |-
+    - op: replace
+      path: /spec/template/spec/containers/0/resources/requests/cpu
+      value: 200m
+    - op: replace
+      path: /spec/template/spec/containers/0/resources/requests/memory
+      value: 512Mi
+    - op: replace
+      path: /spec/template/spec/containers/0/resources/limits/cpu
+      value: 1000m
+    - op: replace
+      path: /spec/template/spec/containers/0/resources/limits/memory
+      value: 1Gi
+  target:
+    kind: Deployment
+    name: "patient-app|doctor-app"
+
+- patch: |-
+    - op: replace
+      path: /spec/template/spec/containers/0/resources/requests/cpu
+      value: 1000m
+    - op: replace
+      path: /spec/template/spec/containers/0/resources/requests/memory
+      value: 2Gi
+    - op: replace
+      path: /spec/template/spec/containers/0/resources/limits/cpu
+      value: 4000m
+    - op: replace
+      path: /spec/template/spec/containers/0/resources/limits/memory
+      value: 8Gi
+  target:
+    kind: Deployment
+    name: "agent-service"
+
+# Production ConfigMaps
+configMapGenerator:
+- name: patient-app-config
+  behavior: merge
+  literals:
+  - api-base-url=https://api.nornos.io
+  - auth-service-url=https://auth.nornos.io
+
+- name: agent-service-config
+  behavior: merge
+  literals:
+  - relay-server-url=http://prod-relay-server
+  - log-level=INFO
+  - cache-ttl=3600
+
+# Production uses external secrets (AWS Secrets Manager via External Secrets Operator)
+# Reference: https://external-secrets.io/
+
+# Production images (specific versions, never 'latest')
+images:
+- name: nornos/patient-app
+  newTag: v1.0.0
+- name: nornos/doctor-app
+  newTag: v1.0.0
+- name: nornos/agent-service
+  newTag: v1.0.0
+- name: nornos/relay-server
+  newTag: v1.0.0
+- name: nornos/shared-data-server
+  newTag: v1.0.0
+- name: nornos/auth-service
+  newTag: v1.0.0
+- name: nornos/vault-server
+  newTag: v1.0.0

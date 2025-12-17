@@ -1,0 +1,110 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nornos-ingress
+  namespace: nornos
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+spec:
+  tls:
+  - hosts:
+    - patient.nornos.io
+    - doctor.nornos.io
+    - api.nornos.io
+    - relay.nornos.io
+    - auth.nornos.io
+    secretName: nornos-tls
+  rules:
+  # Patient App
+  - host: patient.nornos.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: patient-app
+            port:
+              number: 80
+  # Doctor App
+  - host: doctor.nornos.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: doctor-app
+            port:
+              number: 80
+  # API (Shared Data Server)
+  - host: api.nornos.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: shared-data-server
+            port:
+              number: 80
+  # Relay Server
+  - host: relay.nornos.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: relay-server
+            port:
+              number: 80
+  # Auth Service
+  - host: auth.nornos.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: auth-service
+            port:
+              number: 80
+---
+# Separate ingress for agent service (longer timeouts)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nornos-agent-ingress
+  namespace: nornos
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+  - hosts:
+    - agents.nornos.io
+    secretName: nornos-agents-tls
+  rules:
+  - host: agents.nornos.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: agent-service
+            port:
+              number: 80

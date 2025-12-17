@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  AWS_REGION: eu-central-1
+  TERRAFORM_VERSION: 1.6.0
+
+jobs:
+  # Terraform validation and planning
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, staging, production]
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+    - name: Terraform Format Check
+      run: terraform fmt -check -recursive
+      working-directory: terraform
+
+    - name: Terraform Init
+      run: terraform init -backend=false
+      working-directory: terraform/environments/${{ matrix.environment }}
+
+    - name: Terraform Validate
+      run: terraform validate
+      working-directory: terraform/environments/${{ matrix.environment }}
+
+    - name: Terraform Plan (dry-run)
+      if: github.event_name == 'pull_request'
+      run: terraform plan -input=false -no-color
+      working-directory: terraform/environments/${{ matrix.environment }}
+      continue-on-error: true
+
+  # Kubernetes manifest validation
+  kubernetes:
+    name: Kubernetes
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: v1.29.0
+
+    - name: Install kustomize
+      uses: imranismail/setup-kustomize@v2
+
+    - name: Validate base manifests
+      run: |
+        for dir in kubernetes/base/*/; do
+          echo "Validating $dir"
+          kubectl apply --dry-run=client -f "$dir" || true
+        done
+
+    - name: Build kustomize overlays
+      run: |
+        for env in dev staging production; do
+          echo "Building overlay: $env"
+          kustomize build kubernetes/overlays/$env || true
+        done
+
+  # Security scanning
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner (IaC)
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: config
+        scan-ref: .
+        exit-code: 1
+        severity: CRITICAL,HIGH
+
+    - name: Run checkov
+      uses: bridgecrewio/checkov-action@master
+      with:
+        directory: terraform
+        framework: terraform
+        soft_fail: true
+
+  # Documentation
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Check markdown links
+      uses: gaurav-nelson/github-action-markdown-link-check@v1
+      with:
+        use-quiet-mode: yes
+        config-file: .github/markdown-link-check.json
+      continue-on-error: true
+
+    - name: Generate Terraform docs
+      uses: terraform-docs/gh-actions@v1.0.0
+      with:
+        working-dir: terraform/modules
+        output-file: README.md
+        recursive: true
+      continue-on-error: true
