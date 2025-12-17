@@ -1,0 +1,268 @@
+# Nornos Production - Single VM Deployment
+# 
+# Requirements:
+# - Ubuntu 22.04+ or Debian 12+
+# - Minimum: 4 vCPU, 16GB RAM, 100GB SSD
+# - Recommended: 8 vCPU, 32GB RAM, 200GB SSD
+# - Docker & Docker Compose installed
+# - Domain pointing to server IP
+#
+# Usage:
+#   1. Copy .env.example to .env and configure
+#   2. Run: docker compose up -d
+#   3. Access via https://patient.yourdomain.com
+
+version: '3.8'
+
+services:
+  # ============================================
+  # REVERSE PROXY & SSL
+  # ============================================
+  traefik:
+    image: traefik:v3.1
+    container_name: nornos-traefik
+    restart: unless-stopped
+    command:
+      - --api.dashboard=true
+      - --api.insecure=false
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      # Let's Encrypt SSL
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+      # Redirect HTTP to HTTPS
+      - --entrypoints.web.http.redirections.entryPoint.to=websecure
+      - --entrypoints.web.http.redirections.entryPoint.scheme=https
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-letsencrypt:/letsencrypt
+    networks:
+      - nornos-frontend
+    labels:
+      - traefik.enable=true
+      # Dashboard (optional, secure with auth)
+      - traefik.http.routers.dashboard.rule=Host(`traefik.${DOMAIN}`)
+      - traefik.http.routers.dashboard.service=api@internal
+      - traefik.http.routers.dashboard.tls.certresolver=letsencrypt
+      - traefik.http.routers.dashboard.middlewares=auth
+      - traefik.http.middlewares.auth.basicauth.users=${TRAEFIK_AUTH}
+
+  # ============================================
+  # DATABASES
+  # ============================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: nornos-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-nornos}
+      POSTGRES_USER: ${POSTGRES_USER:-nornos}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - nornos-backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nornos} -d ${POSTGRES_DB:-nornos}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: nornos-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
+    networks:
+      - nornos-backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================
+  # BACKEND SERVICES
+  # ============================================
+  auth-service:
+    image: ghcr.io/${GITHUB_USER}/nornos-auth-service:${VERSION:-latest}
+    container_name: nornos-auth
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      JWT_SECRET: ${JWT_SECRET}
+    networks:
+      - nornos-frontend
+      - nornos-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.auth.rule=Host(`auth.${DOMAIN}`)
+      - traefik.http.routers.auth.tls.certresolver=letsencrypt
+      - traefik.http.services.auth.loadbalancer.server.port=3001
+
+  shared-data-server:
+    image: ghcr.io/${GITHUB_USER}/nornos-shared-data-server:${VERSION:-latest}
+    container_name: nornos-shared-data
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3003
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    networks:
+      - nornos-frontend
+      - nornos-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.api.rule=Host(`api.${DOMAIN}`)
+      - traefik.http.routers.api.tls.certresolver=letsencrypt
+      - traefik.http.services.api.loadbalancer.server.port=3003
+
+  relay-server:
+    image: ghcr.io/${GITHUB_USER}/nornos-relay-server:${VERSION:-latest}
+    container_name: nornos-relay
+    restart: unless-stopped
+    environment:
+      PORT: 8001
+      SHARED_DATA_SERVER_URL: http://shared-data-server:3003
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+    networks:
+      - nornos-frontend
+      - nornos-backend
+    depends_on:
+      - shared-data-server
+      - redis
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.relay.rule=Host(`relay.${DOMAIN}`)
+      - traefik.http.routers.relay.tls.certresolver=letsencrypt
+      - traefik.http.services.relay.loadbalancer.server.port=8001
+
+  vault-server:
+    image: ghcr.io/${GITHUB_USER}/nornos-vault-server:${VERSION:-latest}
+    container_name: nornos-vault
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3006
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    volumes:
+      - vault-data:/app/data
+    networks:
+      - nornos-frontend
+      - nornos-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.vault.rule=Host(`vault.${DOMAIN}`)
+      - traefik.http.routers.vault.tls.certresolver=letsencrypt
+      - traefik.http.services.vault.loadbalancer.server.port=3006
+
+  agent-service:
+    image: ghcr.io/${GITHUB_USER}/nornos-agent-service:${VERSION:-latest}
+    container_name: nornos-agent
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: production
+      LOG_LEVEL: INFO
+      RELAY_SERVER_URL: http://relay-server:8001
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/2
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    volumes:
+      - agent-cache:/app/cache
+    networks:
+      - nornos-frontend
+      - nornos-backend
+    depends_on:
+      - relay-server
+      - redis
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.agents.rule=Host(`agents.${DOMAIN}`)
+      - traefik.http.routers.agents.tls.certresolver=letsencrypt
+      - traefik.http.services.agents.loadbalancer.server.port=8000
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+  # ============================================
+  # FRONTEND APPLICATIONS
+  # ============================================
+  patient-app:
+    image: ghcr.io/${GITHUB_USER}/nornos-patient-app:${VERSION:-latest}
+    container_name: nornos-patient
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3004
+      NEXT_PUBLIC_API_BASE_URL: https://api.${DOMAIN}
+      NEXT_PUBLIC_AUTH_SERVICE_URL: https://auth.${DOMAIN}
+    networks:
+      - nornos-frontend
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.patient.rule=Host(`patient.${DOMAIN}`)
+      - traefik.http.routers.patient.tls.certresolver=letsencrypt
+      - traefik.http.services.patient.loadbalancer.server.port=3004
+
+  doctor-app:
+    image: ghcr.io/${GITHUB_USER}/nornos-doctor-app:${VERSION:-latest}
+    container_name: nornos-doctor
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3002
+      NEXT_PUBLIC_API_BASE_URL: https://api.${DOMAIN}
+      RELAY_SERVER_URL: http://relay-server:8001
+      AGENT_SERVICE_URL: http://agent-service:8000
+    networks:
+      - nornos-frontend
+      - nornos-backend
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.doctor.rule=Host(`doctor.${DOMAIN}`)
+      - traefik.http.routers.doctor.tls.certresolver=letsencrypt
+      - traefik.http.services.doctor.loadbalancer.server.port=3002
+
+# ============================================
+# NETWORKS & VOLUMES
+# ============================================
+networks:
+  nornos-frontend:
+    name: nornos-frontend
+  nornos-backend:
+    name: nornos-backend
+    internal: true  # No external access
+
+volumes:
+  traefik-letsencrypt:
+  postgres-data:
+  redis-data:
+  vault-data:
+  agent-cache:
